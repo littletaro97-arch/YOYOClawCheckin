@@ -15,8 +15,13 @@ YOYO Claw 每日自动签到（纯标准库实现）
 用法：
   python YOYOClawCheckin.py              # 正常执行
   python YOYOClawCheckin.py --dry-run    # 只查询，不签到
-  python YOYOClawCheckin.py --install-startup   # 注册到"开机启动"
-  python YOYOClawCheckin.py --remove-startup    # 取消开机启动
+  python YOYOClawCheckin.py --install-task     # 一键配置（注册计划任务 + 立即验证一次）
+  python YOYOClawCheckin.py --uninstall-task   # 一键解除配置（注销计划任务）
+
+v1.3 变更：
+  * 触发方式从"启动文件夹"改为"计划任务"：登录时 + 每天两次。
+    启动文件夹只在登录时执行一次，机器长期不注销/只用睡眠时会整天漏跑。
+  * 后台运行时不再闪出控制台黑框（tasklist / schtasks / powershell 全部隐藏窗口）。
 """
 import base64
 import ctypes
@@ -51,6 +56,9 @@ BASE_URL = "https://all-scenario-device.rnd.honor.com"
 PROCESS_NAME = "HnMagicClawUI.exe"
 FP_RE = re.compile(r"^[a-f0-9]{64}$")
 
+VERSION = "1.3"
+CREATE_NO_WINDOW = 0x08000000   # 后台运行时不给子进程分配控制台（否则会闪黑框）
+
 WAIT_SESSION_TIMEOUT = 60    # 秒，等客户端刷新登录态（实测约 10 秒）
 WAIT_SESSION_POLL = 3
 
@@ -83,6 +91,16 @@ def log(msg):
             f.write(line + "\n")
     except OSError:
         pass
+
+
+def run_hidden(cmd, timeout=60):
+    """跑一个命令行程序，不弹黑框。返回 (返回码, stdout, stderr)。"""
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True, errors="replace",
+                           timeout=timeout, creationflags=CREATE_NO_WINDOW)
+        return r.returncode, r.stdout or "", r.stderr or ""
+    except Exception as e:
+        return -1, "", "%s: %s" % (type(e).__name__, e)
 
 
 # ---------------------------------------------------------------- 本机解密
@@ -260,8 +278,7 @@ def app_path():
 
 
 def app_running() -> bool:
-    out = subprocess.run(["tasklist", "/FI", "IMAGENAME eq " + PROCESS_NAME],
-                         capture_output=True, text=True, errors="replace").stdout
+    out = run_hidden(["tasklist", "/FI", "IMAGENAME eq " + PROCESS_NAME], timeout=30)[1]
     return PROCESS_NAME.lower() in out.lower()
 
 
@@ -327,8 +344,10 @@ def wait_for_fresh_session():
     return None, 2
 
 
-# ---------------------------------------------------------------- 开机启动
-STARTUP_VBS = "YOYOClawCheckin.vbs"
+# ---------------------------------------------------------------- 计划任务
+TASK_NAME = "YOYOClawCheckin"
+TASK_TIMES = ("12:00", "20:00")     # 每天两个固定检查点（配合"错过就补跑"）
+LEGACY_VBS = "YOYOClawCheckin.vbs"  # v1.2 及更早的启动文件夹方案，配置时顺手清掉
 
 
 def startup_dir():
@@ -345,25 +364,221 @@ def _pythonw():
     return "pythonw.exe"
 
 
-def install_startup():
+def _me():
+    """当前 Windows 账号，形如 计算机名\\用户名。"""
+    dom = os.environ.get("USERDOMAIN") or os.environ.get("COMPUTERNAME") or ""
+    usr = os.environ.get("USERNAME") or ""
+    return ("%s\\%s" % (dom, usr)) if (dom and usr) else usr
+
+
+def _xesc(s):
+    """XML 文本转义（路径里可能有 & < > " ）。"""
+    return (s.replace("&", "&amp;").replace("<", "&lt;")
+             .replace(">", "&gt;").replace('"', "&quot;"))
+
+
+def task_xml():
+    """计划任务定义：登录时触发一次，另外每天 TASK_TIMES 各触发一次。"""
     here = os.path.dirname(os.path.abspath(__file__))
-    vbs = os.path.join(startup_dir(), STARTUP_VBS)
-    body = ('Set ws = CreateObject("WScript.Shell")\r\n'
-            'ws.CurrentDirectory = "%s"\r\n'
-            'ws.Run """%s"" ""%s""", 0, False\r\n'
-            % (here, _pythonw(), os.path.join(here, "YOYOClawCheckin.py")))
-    # VBS 由 WScript 按系统 ANSI 码页读取，中文路径必须写 mbcs
-    with open(vbs, "w", encoding="mbcs") as f:
-        f.write(body)
-    return vbs
+    me = _xesc(_me())
+    daily = "".join(
+        '    <CalendarTrigger>\n'
+        '      <StartBoundary>%sT%s:00</StartBoundary>\n'
+        '      <Enabled>true</Enabled>\n'
+        '      <ScheduleByDay>\n'
+        '        <DaysInterval>1</DaysInterval>\n'
+        '      </ScheduleByDay>\n'
+        '    </CalendarTrigger>\n' % (dt.date.today().isoformat(), hm)
+        for hm in TASK_TIMES)
+    return (
+        '<?xml version="1.0" encoding="UTF-16"?>\n'
+        '<Task version="1.2" '
+        'xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">\n'
+        '  <RegistrationInfo>\n'
+        '    <Description>YOYO Claw 每日自动签到（登录时 + 每天 %s）</Description>\n'
+        '  </RegistrationInfo>\n'
+        '  <Triggers>\n'
+        '    <LogonTrigger>\n'
+        '      <Enabled>true</Enabled>\n'
+        '      <UserId>%s</UserId>\n'
+        '    </LogonTrigger>\n'
+        '%s'
+        '  </Triggers>\n'
+        '  <Principals>\n'
+        '    <Principal id="Author">\n'
+        '      <UserId>%s</UserId>\n'
+        '      <LogonType>InteractiveToken</LogonType>\n'
+        '      <RunLevel>LeastPrivilege</RunLevel>\n'
+        '    </Principal>\n'
+        '  </Principals>\n'
+        '  <Settings>\n'
+        '    <MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>\n'
+        '    <DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>\n'
+        '    <StopIfGoingOnBatteries>false</StopIfGoingOnBatteries>\n'
+        '    <AllowHardTerminate>true</AllowHardTerminate>\n'
+        '    <StartWhenAvailable>true</StartWhenAvailable>\n'
+        '    <RunOnlyIfNetworkAvailable>false</RunOnlyIfNetworkAvailable>\n'
+        '    <IdleSettings>\n'
+        '      <StopOnIdleEnd>false</StopOnIdleEnd>\n'
+        '      <RestartOnIdle>false</RestartOnIdle>\n'
+        '    </IdleSettings>\n'
+        '    <AllowStartOnDemand>true</AllowStartOnDemand>\n'
+        '    <Enabled>true</Enabled>\n'
+        '    <Hidden>false</Hidden>\n'
+        '    <RunOnlyIfIdle>false</RunOnlyIfIdle>\n'
+        '    <WakeToRun>false</WakeToRun>\n'
+        '    <ExecutionTimeLimit>PT15M</ExecutionTimeLimit>\n'
+        '    <Priority>7</Priority>\n'
+        '  </Settings>\n'
+        '  <Actions Context="Author">\n'
+        '    <Exec>\n'
+        '      <Command>%s</Command>\n'
+        '      <Arguments>"%s"</Arguments>\n'
+        '      <WorkingDirectory>%s</WorkingDirectory>\n'
+        '    </Exec>\n'
+        '  </Actions>\n'
+        '</Task>\n'
+        % (" / ".join(TASK_TIMES), me, daily, me, _xesc(_pythonw()),
+           _xesc(os.path.join(here, "YOYOClawCheckin.py")), _xesc(here)))
 
 
-def remove_startup():
-    vbs = os.path.join(startup_dir(), STARTUP_VBS)
+PS_REGISTER = (
+    "$ErrorActionPreference = 'Stop'\n"
+    "$xml = [System.IO.File]::ReadAllText('%s')\n"
+    "Register-ScheduledTask -TaskName '%s' -Xml $xml -Force | Out-Null\n"
+    "$t = Get-ScheduledTask -TaskName '%s'\n"
+    "$i = Get-ScheduledTaskInfo -TaskName '%s'\n"
+    "Write-Output ('STATE=' + $t.State)\n"
+    "Write-Output ('TRIGGERS=' + $t.Triggers.Count)\n"
+    "if ($i.NextRunTime) { Write-Output ('NEXTRUN=' + "
+    "$i.NextRunTime.ToString('yyyy-MM-dd HH:mm:ss')) }\n"
+)
+
+PS_QUERY = (
+    "$ErrorActionPreference = 'Stop'\n"
+    "$t = Get-ScheduledTask -TaskName '%s'\n"
+    "$i = Get-ScheduledTaskInfo -TaskName '%s'\n"
+    "Write-Output ('STATE=' + $t.State)\n"
+    "Write-Output ('TRIGGERS=' + $t.Triggers.Count)\n"
+    "if ($i.NextRunTime) { Write-Output ('NEXTRUN=' + "
+    "$i.NextRunTime.ToString('yyyy-MM-dd HH:mm:ss')) }\n"
+)
+
+PS_UNREGISTER = (
+    "$ErrorActionPreference = 'Stop'\n"
+    "$t = Get-ScheduledTask -TaskName '%s' -ErrorAction SilentlyContinue\n"
+    "if ($null -eq $t) { Write-Output 'EXISTED=0' }\n"
+    "else { Write-Output 'EXISTED=1'\n"
+    "  Unregister-ScheduledTask -TaskName '%s' -Confirm:$false\n"
+    "  Write-Output 'REMOVED=1' }\n"
+)
+
+
+def _run_ps(tag, body):
+    """把一段 PowerShell 写成临时脚本再跑（避开命令行转义），返回 (返回码, stdout, stderr)。"""
+    path = os.path.join(STATE_DIR, tag + ".ps1")
+    try:
+        with open(path, "w", encoding="utf-8-sig") as f:
+            f.write(body)
+        return run_hidden(["powershell", "-NoProfile", "-NonInteractive",
+                           "-ExecutionPolicy", "Bypass", "-File", path], timeout=120)
+    finally:
+        try:
+            os.remove(path)
+        except OSError:
+            pass
+
+
+def _cleanup_legacy():
+    """删掉 v1.2 的启动文件夹项，避免和计划任务重复运行。"""
+    vbs = os.path.join(startup_dir(), LEGACY_VBS)
     if os.path.exists(vbs):
-        os.remove(vbs)
-        return vbs
-    return None
+        try:
+            os.remove(vbs)
+            log("已清理旧版启动项: %s" % vbs)
+        except OSError as e:
+            log("旧版启动项删不掉（不影响使用，但会重复跑一次）: %r" % e)
+
+
+def install_task():
+    """注册计划任务。返回 (是否成功, 说明字符串)。"""
+    xmlpath = os.path.join(STATE_DIR, "task.xml")
+    with open(xmlpath, "w", encoding="utf-16") as f:
+        f.write(task_xml())
+
+    how, info, err = None, {}, ""
+    try:
+        rc, out, serr = _run_ps("install", PS_REGISTER % (xmlpath, TASK_NAME, TASK_NAME, TASK_NAME))
+        state = re.search(r"^STATE=(.+)$", out, re.M)
+        if rc == 0 and state:
+            how = "PowerShell Register-ScheduledTask"
+            info["state"] = state.group(1).strip()
+            m = re.search(r"^TRIGGERS=(\d+)$", out, re.M)
+            if m:
+                info["triggers"] = m.group(1)
+            m = re.search(r"^NEXTRUN=(.+)$", out, re.M)
+            if m:
+                info["next"] = m.group(1).strip()
+        else:
+            err = (serr or out).strip()[:300]
+    except Exception as e:
+        err = "%s: %s" % (type(e).__name__, e)
+
+    if not how:
+        # 退路：PowerShell 用不了时改用系统自带的 schtasks
+        rc, out, serr = run_hidden(["schtasks", "/Create", "/TN", TASK_NAME,
+                                    "/XML", xmlpath, "/F"], timeout=120)
+        if rc == 0:
+            how = "schtasks /Create"
+            _, out2, _ = _run_ps("query", PS_QUERY % (TASK_NAME, TASK_NAME))
+            m = re.search(r"^NEXTRUN=(.+)$", out2, re.M)
+            if m:
+                info["next"] = m.group(1).strip()
+        else:
+            err = (serr or out).strip()[:300]
+
+    try:
+        os.remove(xmlpath)
+    except OSError:
+        pass
+
+    if not how:
+        return False, "注册计划任务失败：%s" % err
+    _cleanup_legacy()
+    msg = "已注册计划任务（%s），触发器 %s 个" % (
+        how, info.get("triggers", len(TASK_TIMES) + 1))
+    if info.get("next"):
+        msg += "，下次运行 %s" % info["next"]
+    return True, msg
+
+
+def uninstall_task():
+    """注销计划任务。返回 (是否成功, 说明字符串)。"""
+    existed, how, err = False, None, ""
+    try:
+        rc, out, serr = _run_ps("uninstall",
+                                PS_UNREGISTER % (TASK_NAME, TASK_NAME))
+        if rc == 0 and "EXISTED=" in out:
+            existed = "EXISTED=1" in out
+            if not existed or "REMOVED=1" in out:
+                how = "PowerShell Unregister-ScheduledTask"
+        else:
+            err = (serr or out).strip()[:300]
+    except Exception as e:
+        err = "%s: %s" % (type(e).__name__, e)
+
+    if not how:
+        rc, out, serr = run_hidden(["schtasks", "/Delete", "/TN", TASK_NAME, "/F"],
+                                   timeout=120)
+        if rc == 0:
+            existed, how = True, "schtasks /Delete"
+        else:
+            err = (serr or out).strip()[:300]
+
+    _cleanup_legacy()
+    if how:
+        return True, ("已解除配置（%s）" % how) if existed else "本来就没有配置过计划任务"
+    return False, "注销计划任务失败：%s" % err
 
 
 # ---------------------------------------------------------------- 主流程
@@ -442,19 +657,8 @@ def alert(msg):
         pass
 
 
-def main():
-    args = sys.argv[1:]
-    if "--install-startup" in args:
-        log("已注册开机启动: %s" % install_startup())
-        return 0
-    if "--remove-startup" in args:
-        v = remove_startup()
-        log("已取消开机启动" if v else "开机启动项本来就不存在")
-        return 0
-
-    dry = "--dry-run" in args
-    os.makedirs(STATE_DIR, exist_ok=True)
-
+def run_with_retries(dry):
+    """带重试地跑一次签到，返回退出码。"""
     code = 0
     for attempt in range(1, RETRY_TIMES + 1):
         code = run_once(dry)
@@ -465,7 +669,38 @@ def main():
             break
         log("第 %d 次失败（退出码 %d），%d 秒后重试 ..." % (attempt, code, RETRY_GAP))
         time.sleep(RETRY_GAP)
+    return code
 
+
+def main():
+    args = sys.argv[1:]
+    os.makedirs(STATE_DIR, exist_ok=True)
+    log("YOYO Claw 自动签到 v%s" % VERSION)
+
+    if "--install-task" in args:
+        ok, msg = install_task()
+        log(msg)
+        if not ok:
+            return 8
+        log("下面立即执行一次签到，验证整条链路是否真的可用 ...")
+        code = run_with_retries(False)
+        if code == 0:
+            log("一键配置成功。以后每天自动运行，不用再管。")
+        else:
+            log("计划任务已经配好了，但这次立即验证没有通过（退出码 %d），"
+                "请看上面的提示处理。" % code)
+            alert(FAIL_HINT.get(code, "配置后立即验证失败，退出码 %d。" % code))
+        return code
+
+    if "--uninstall-task" in args:
+        ok, msg = uninstall_task()
+        log(msg)
+        if not ok:
+            return 8
+        log("已停止每日自动签到。日志和记录保留在 %s，不想留就整个删掉。" % STATE_DIR)
+        return 0
+
+    code = run_with_retries("--dry-run" in args)
     if code:
         alert(FAIL_HINT.get(code, "自动签到失败，退出码 %d。详情看运行日志。" % code))
     return code
